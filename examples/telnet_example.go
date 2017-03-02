@@ -3,8 +3,8 @@ package main
 import (
 	"flag"
 	"fmt"
-	"github.com/Juniper/go-netconf/netconf"
-	"github.com/Juniper/go-netconf/netconf/jnpr"
+	"github.com/charl/go-netconf/netconf"
+	"github.com/charl/go-netconf/netconf/jnpr"
 	"os"
 )
 
