@@ -90,6 +90,7 @@ func (t *transportBasicIO) WaitForFunc(f func([]byte) (int, error)) ([]byte, err
 	pos := 0
 	for {
 		n, err := t.Read(buf[pos : pos+(len(buf)/2)])
+		log.Debugf("WaitForFunc: pos: %d, n: %d, buf: %s, err: %#v\n", pos, n, string(buf), err)
 		if err != nil {
 			if err != io.EOF {
 				return nil, err

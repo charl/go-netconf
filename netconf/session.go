@@ -29,7 +29,7 @@ func (s *Session) Exec(methods ...RPCMethod) (*RPCReply, error) {
 	header := []byte(xml.Header)
 	request = append(header, request...)
 
-	log.Debugf("REQUEST: %s\n", request)
+	log.Debugf("Exec: REQUEST: %s\n", request)
 
 	err = s.Transport.Send(request)
 	if err != nil {
@@ -40,7 +40,53 @@ func (s *Session) Exec(methods ...RPCMethod) (*RPCReply, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.Debugf("REPLY: %s\n", rawXML)
+	log.Debugf("Exec: REPLY: %s\n", rawXML)
+
+	reply := &RPCReply{}
+	reply.RawReply = string(rawXML)
+
+	if err := xml.Unmarshal(rawXML, reply); err != nil {
+		return nil, err
+	}
+
+	if reply.Errors != nil {
+		// We have errors, lets see if it's a warning or an error.
+		for _, rpcErr := range reply.Errors {
+			if rpcErr.Severity == "error" || s.ErrOnWarning {
+				return reply, &rpcErr
+			}
+		}
+
+	}
+
+	return reply, nil
+}
+
+// ExecWithMessageID is used to execute an RPC method or methods with the supplied message-id.
+func (s *Session) ExecWithMessageID(messageID string, methods ...RPCMethod) (*RPCReply, error) {
+	rpc := NewRPCMessage(methods)
+	rpc.MessageID = messageID
+
+	request, err := xml.Marshal(rpc)
+	if err != nil {
+		return nil, err
+	}
+
+	header := []byte(xml.Header)
+	request = append(header, request...)
+
+	log.Debugf("ExecWithMessageID: REQUEST: %s\n", request)
+
+	err = s.Transport.Send(request)
+	if err != nil {
+		return nil, err
+	}
+
+	rawXML, err := s.Transport.Receive()
+	if err != nil {
+		return nil, err
+	}
+	log.Debugf("ExecWithMessageID: REPLY: %s\n", rawXML)
 
 	reply := &RPCReply{}
 	reply.RawReply = string(rawXML)
