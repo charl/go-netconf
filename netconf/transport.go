@@ -28,8 +28,10 @@ type HelloMessage struct {
 // Transport interface defines what characterisitics make up a NetConf transport
 // layer object.
 type Transport interface {
-	Send([]byte) error
-	Receive() ([]byte, error)
+	send([]byte) error
+	receive() ([]byte, error)
+	SendReceive(string, []byte) ([]byte, error)
+	StartReader()
 	Close() error
 	ReceiveHello() (*HelloMessage, error)
 	SendHello(*HelloMessage) error
@@ -38,18 +40,19 @@ type Transport interface {
 type transportBasicIO struct {
 	io.ReadWriteCloser
 	chunkedFraming bool
+	log            Logger
 }
 
 // Sends a well formated netconf rpc message as a slice of bytes adding on the
 // nessisary framining messages.
-func (t *transportBasicIO) Send(data []byte) error {
+func (t *transportBasicIO) send(data []byte) error {
 	t.Write(data)
 	t.Write([]byte(msgSeperator))
 	t.Write([]byte("\n"))
 	return nil // TODO: Implement error handling!
 }
 
-func (t *transportBasicIO) Receive() ([]byte, error) {
+func (t *transportBasicIO) receive() ([]byte, error) {
 	return t.WaitForBytes([]byte(msgSeperator))
 }
 
@@ -61,14 +64,15 @@ func (t *transportBasicIO) SendHello(hello *HelloMessage) error {
 
 	header := []byte(xml.Header)
 	val = append(header, val...)
-	err = t.Send(val)
+	err = t.send(val)
+
 	return err
 }
 
 func (t *transportBasicIO) ReceiveHello() (*HelloMessage, error) {
 	hello := new(HelloMessage)
 
-	val, err := t.Receive()
+	val, err := t.receive()
 	if err != nil {
 		return hello, err
 	}
@@ -90,7 +94,6 @@ func (t *transportBasicIO) WaitForFunc(f func([]byte) (int, error)) ([]byte, err
 	pos := 0
 	for {
 		n, err := t.Read(buf[pos : pos+(len(buf)/2)])
-		log.Debugf("WaitForFunc: pos: %d, n: %d, buf: %s, err: %#v\n", pos, n, string(buf), err)
 		if err != nil {
 			if err != io.EOF {
 				return nil, err

@@ -1,8 +1,11 @@
 package netconf
 
 import (
+	"bufio"
+	"bytes"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -10,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/karlseguin/cmap"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
@@ -19,31 +23,138 @@ const (
 	sshDefaultPort = 830
 	// sshNetconfSubsystem sets the SSH subsystem to NetConf
 	sshNetconfSubsystem = "netconf"
+
+	token       = "message-id="
+	maxLineSize = 512 * 1024
 )
+
+// delimetedSplitFunc spits lines on the msgSeperator.
+func delimetedSplitFunc(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if atEOF && len(data) == 0 {
+		return 0, nil, nil
+	}
+
+	if i := strings.Index(string(data), msgSeperator); i >= 0 {
+		return i + len(msgSeperator) + 1, data[0:i], nil
+	}
+
+	if atEOF {
+		return len(data), data, nil
+	}
+
+	return
+}
 
 // TransportSSH maintains the information necessary to communicate with the
 // remote device over SSH
 type TransportSSH struct {
 	transportBasicIO
-	sshClient  *ssh.Client
-	sshSession *ssh.Session
+	sshClient    *ssh.Client
+	sshSession   *ssh.Session
+	log          Logger
+	messageIndex cmap.CMap
+}
+
+// StartReader starts a continuous buffered reader on the data responses.
+func (t *TransportSSH) StartReader() {
+	t.messageIndex = cmap.New()
+	go t.startReader()
+}
+
+// startReader starts up a buffered reader on the responses coming back over the connection.
+func (t *TransportSSH) startReader() {
+	scanner := bufio.NewScanner(t.ReadWriteCloser)
+	buf := make([]byte, maxLineSize)
+	scanner.Buffer(buf, maxLineSize)
+	scanner.Split(delimetedSplitFunc)
+	var (
+		messageID string
+		ok        bool
+		out       interface{}
+	)
+
+	for scanner.Scan() {
+		t.log.Debugf("SCAN TEXT: %s", scanner.Text())
+		messageID = t.parseMessageID(scanner.Bytes())
+		if messageID == "" {
+			t.log.Debugf("error: missing message-id from response: %s", scanner.Text())
+			continue
+		}
+
+		out, ok = t.messageIndex.Get(messageID)
+		if !ok {
+			t.log.Debugf("error: unknown message-id: %s", scanner.Text())
+			continue
+		}
+
+		out.(chan []byte) <- scanner.Bytes()
+	}
+
+	if err := scanner.Err(); err != nil {
+		t.log.Debugf("error: %s", err)
+		t.CloseWithError(errors.New("error: scanner.Scan(): " + err.Error()))
+	}
+}
+
+func (t *TransportSSH) parseMessageID(line []byte) string {
+	i := bytes.Index(line, []byte("message-id="))
+	if i == -1 {
+		return ""
+	}
+	i = i + len(token) + 1
+
+	j := i + len(line[i:i+bytes.Index(line[i:], []byte(`">`))])
+
+	return string(line[i:j])
+}
+
+func (t *TransportSSH) SendReceive(messageID string, data []byte) ([]byte, error) {
+	t.messageIndex.Set(messageID, make(chan []byte, 1))
+	defer t.messageIndex.Delete(messageID)
+
+	err := t.send(data)
+	if err != nil {
+		t.log.Debugf("error: %s", err)
+		return nil, err
+	}
+
+	out, ok := t.messageIndex.Get(messageID)
+	if !ok {
+		return nil, errors.New("error: cannot find matching response for: " + string(data))
+	}
+
+	select {
+	case res := <-out.(chan []byte):
+		t.log.Debugf("out: %s", string(res))
+		return res, nil
+
+	case <-time.After(time.Second * 30):
+		return nil, errors.New("RPC timeout: " + string(data))
+	}
 }
 
 // Close closes an existing SSH session and socket if they exist.
 func (t *TransportSSH) Close() error {
-	// Close the SSH Session if we have one
+	// Close the SSH Session if we have one.
 	if t.sshSession != nil {
 		if err := t.sshSession.Close(); err != nil {
 			return err
 		}
 	}
 
-	// Close the socket
+	// Close the socket.
 	if err := t.sshClient.Close(); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+// CloseWithError closes an existing SSH session and socket if they exist and reports an error.
+func (t *TransportSSH) CloseWithError(err error) error {
+	_ = t.Close()
+
+	return err
 }
 
 // Dial connects and establishes SSH sessions
@@ -104,12 +215,12 @@ func (t *TransportSSH) setupSession() error {
 
 // NewSSHSession creates a new NETCONF session using an existing net.Conn.
 func NewSSHSession(conn net.Conn, config *ssh.ClientConfig) (*Session, error) {
-	t, err := connToTransport(conn, config)
+	t, err := connToTransport(conn, config, log)
 	if err != nil {
 		return nil, err
 	}
 
-	return NewSession(t), nil
+	return NewSession(t, log), nil
 }
 
 // DialSSH creates a new NETCONF session using a SSH Transport.
@@ -120,7 +231,7 @@ func DialSSH(target string, config *ssh.ClientConfig) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	return NewSession(&t), nil
+	return NewSession(&t, log), nil
 }
 
 // DialSSHTimeout creates a new NETCONF session using a SSH Transport with timeout.
@@ -133,7 +244,7 @@ func DialSSHTimeout(target string, config *ssh.ClientConfig, timeout time.Durati
 	}
 
 	conn := &deadlineConn{Conn: bareConn, timeout: timeout}
-	t, err := connToTransport(conn, config)
+	t, err := connToTransport(conn, config, log)
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +260,7 @@ func DialSSHTimeout(target string, config *ssh.ClientConfig, timeout time.Durati
 		}
 	}()
 
-	return NewSession(t), nil
+	return NewSession(t, log), nil
 }
 
 // SSHConfigPassword is a convience function that takes a username and password
@@ -217,13 +328,14 @@ func SSHConfigPubKeyAgent(user string) (*ssh.ClientConfig, error) {
 	}, nil
 }
 
-func connToTransport(conn net.Conn, config *ssh.ClientConfig) (*TransportSSH, error) {
+func connToTransport(conn net.Conn, config *ssh.ClientConfig, log Logger) (*TransportSSH, error) {
 	c, chans, reqs, err := ssh.NewClientConn(conn, conn.RemoteAddr().String(), config)
 	if err != nil {
 		return nil, err
 	}
 
 	t := &TransportSSH{}
+	t.log = log
 	t.sshClient = ssh.NewClient(c, chans, reqs)
 
 	err = t.setupSession()
